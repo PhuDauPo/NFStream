@@ -19,6 +19,11 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# Logger riêng cho từng luồng
+log_capture = logging.getLogger("CAPTURE")   # Luồng 1: Quét 75 trường
+log_predict = logging.getLogger("PREDICT")   # Luồng 2: Kết quả mô hình
+log_anomaly = logging.getLogger("ANOMALY")   # Luồng 3: Gửi dữ liệu tấn công
+
 # ─── CONFIG ─────────────────────────────────────────────────
 API_URL    = os.getenv("API_URL",    "http://localhost:5000/predict")
 INTERFACE  = "wlan0"
@@ -70,13 +75,25 @@ ALL_FIELDS = [
     "server_fingerprint", "user_agent", "content_type",
 ]
 
-# ─── 15 FEATURES (cho Student model) ────────────────────────
-TOP15_FEATURES = [
-    'src2dst_syn_ratio', 'bidirectional_syn_ratio', 'bidirectional_rst_ratio',
-    'application_confidence', 'dst_port_is_well_known', 'dst_port_bucket',
-    'dst2src_rst_packets', 'protocol', 'src2dst_syn_packets',
-    'application_category_name', 'dst2src_min_ps', 'pkt_per_byte_ratio',
-    'dst2src_stddev_ps', 'bidirectional_min_ps', 'bidirectional_syn_packets',
+# ─── 17 FEATURES (cho Student model) ────────────────────────
+TOP17_FEATURES = [
+    'protocol',                      # 1. Giao thức (TCP/UDP)
+    'dst_port',                      # 2. Port đích
+    'bidirectional_packets',         # 3. Tổng số packets hai chiều
+    'src2dst_packets',               # 4. Số packets từ nguồn đến đích
+    'dst2src_packets',               # 5. Số packets từ đích về nguồn
+    'bidirectional_bytes',           # 6. Tổng số bytes hai chiều
+    'src2dst_bytes',                 # 7. Số bytes từ nguồn đến đích
+    'dst2src_bytes',                 # 8. Số bytes từ đích về nguồn
+    'bidirectional_mean_ps',         # 9. Trung bình packet size hai chiều
+    'bidirectional_stddev_ps',       # 10. Độ lệch chuẩn packet size
+    'bidirectional_duration_ms',     # 11. Thời lượng flow (ms)
+    'bidirectional_mean_piat_ms',    # 12. Trung bình inter-arrival time
+    'bidirectional_max_piat_ms',     # 13. Max inter-arrival time
+    'bidirectional_syn_packets',     # 14. Số SYN packets hai chiều
+    'bidirectional_rst_packets',     # 15. Số RST packets hai chiều
+    'pkt_per_byte_ratio',            # 16. Tỷ lệ packets/bytes
+    'flow_symmetry',                 # 17. Độ đối xứng của flow
 ]
 
 # ─── QUEUES ─────────────────────────────────────────────────
@@ -84,7 +101,7 @@ TOP15_FEATURES = [
 _flow_counter = itertools.count(1)
 
 # item trong LOG_QUEUE     : (flow_id, flow_dict_75)
-# item trong PREDICT_QUEUE : (flow_id, feats_15, src_ip, dst_ip, dst_port)
+# item trong PREDICT_QUEUE : (flow_id, feats_17, src_ip, dst_ip, dst_port)
 LOG_QUEUE     = Queue(maxsize=256)
 PREDICT_QUEUE = Queue(maxsize=256)
 
@@ -128,41 +145,44 @@ def extract_all_fields(flow) -> dict:
 
 
 def extract_features(flow) -> list:
-    """Trích xuất 15 features cho Student model."""
+    """Trích xuất 17 features cho Student model."""
+    # Lấy các giá trị cơ bản từ flow
+    protocol              = safe_get(flow, 'protocol')
     dst_port              = safe_get(flow, 'dst_port')
-    src2dst_packets       = safe_get(flow, 'src2dst_packets')
     bidirectional_packets = safe_get(flow, 'bidirectional_packets')
+    src2dst_packets       = safe_get(flow, 'src2dst_packets')
+    dst2src_packets       = safe_get(flow, 'dst2src_packets')
     bidirectional_bytes   = safe_get(flow, 'bidirectional_bytes')
-    src2dst_syn_packets   = safe_get(flow, 'src2dst_syn_packets')
-    bidir_syn_packets     = safe_get(flow, 'bidirectional_syn_packets')
-    bidir_rst_packets     = safe_get(flow, 'bidirectional_rst_packets')
-
-    src2dst_syn_ratio  = src2dst_syn_packets / src2dst_packets       if src2dst_packets > 0       else 0.0
-    bidir_syn_ratio    = bidir_syn_packets   / bidirectional_packets if bidirectional_packets > 0 else 0.0
-    bidir_rst_ratio    = bidir_rst_packets   / bidirectional_packets if bidirectional_packets > 0 else 0.0
-    pkt_per_byte_ratio = bidirectional_packets / bidirectional_bytes  if bidirectional_bytes > 0  else 0.0
-
-    dst_port_is_well_known = 1.0 if dst_port <= 1023 else 0.0
-    dst_port_bucket = 0 if dst_port <= 1023 else (1 if dst_port <= 49151 else 2)
-
-    cat_name = safe_get(flow, 'application_category_name', 'Unspecified') or 'Unspecified'
-    if cat_name not in APP_CAT_MAP:
-        log.warning("Unknown nDPI category: '%s'", cat_name)
-    cat_encoded = APP_CAT_MAP.get(cat_name, APP_CAT_MAP['Unspecified'])
-
+    src2dst_bytes         = safe_get(flow, 'src2dst_bytes')
+    dst2src_bytes         = safe_get(flow, 'dst2src_bytes')
+    
+    # Tính toán các features phái sinh
+    pkt_per_byte_ratio = bidirectional_packets / bidirectional_bytes if bidirectional_bytes > 0 else 0.0
+    
+    # flow_symmetry: Độ đối xứng giữa src→dst và dst→src
+    # Công thức: min(src2dst_bytes, dst2src_bytes) / max(src2dst_bytes, dst2src_bytes)
+    max_bytes = max(src2dst_bytes, dst2src_bytes)
+    min_bytes = min(src2dst_bytes, dst2src_bytes)
+    flow_symmetry = min_bytes / max_bytes if max_bytes > 0 else 0.0
+    
     return [
-        src2dst_syn_ratio, bidir_syn_ratio, bidir_rst_ratio,
-        safe_get(flow, 'application_confidence'),
-        dst_port_is_well_known, dst_port_bucket,
-        safe_get(flow, 'dst2src_rst_packets'),
-        safe_get(flow, 'protocol'),
-        src2dst_syn_packets,
-        cat_encoded,
-        safe_get(flow, 'dst2src_min_ps'),
-        pkt_per_byte_ratio,
-        safe_get(flow, 'dst2src_stddev_ps'),
-        safe_get(flow, 'bidirectional_min_ps'),
-        bidir_syn_packets,
+        protocol,                                    # 1
+        dst_port,                                    # 2
+        bidirectional_packets,                       # 3
+        src2dst_packets,                             # 4
+        dst2src_packets,                             # 5
+        bidirectional_bytes,                         # 6
+        src2dst_bytes,                               # 7
+        dst2src_bytes,                               # 8
+        safe_get(flow, 'bidirectional_mean_ps'),     # 9
+        safe_get(flow, 'bidirectional_stddev_ps'),   # 10
+        safe_get(flow, 'bidirectional_duration_ms'), # 11
+        safe_get(flow, 'bidirectional_mean_piat_ms'),# 12
+        safe_get(flow, 'bidirectional_max_piat_ms'), # 13
+        safe_get(flow, 'bidirectional_syn_packets'), # 14
+        safe_get(flow, 'bidirectional_rst_packets'), # 15
+        pkt_per_byte_ratio,                          # 16
+        flow_symmetry,                               # 17
     ]
 
 
@@ -174,6 +194,15 @@ def sender_log_thread(mqtt_conn):
         flow_id, flow_dict = LOG_QUEUE.get()
         if mqtt_conn:
             try:
+                # Log thông tin 75 trường đã quét
+                log_capture.info("📊 [%s] Captured 75 fields → src=%s dst=%s port=%s proto=%s packets=%s",
+                                flow_id[:12],
+                                flow_dict.get('src_ip', 'N/A'),
+                                flow_dict.get('dst_ip', 'N/A'),
+                                flow_dict.get('dst_port', 'N/A'),
+                                flow_dict.get('protocol', 'N/A'),
+                                flow_dict.get('bidirectional_packets', 'N/A'))
+                
                 payload = json.dumps({
                     "flow_id":   flow_id,          # ← khóa chính để match với anomaly
                     "device_id": CLIENT_ID,
@@ -190,7 +219,7 @@ def sender_log_thread(mqtt_conn):
         LOG_QUEUE.task_done()
 
 
-# ─── THREAD 2: SENDER PREDICT (15 features → /predict → anomaly) ──
+# ─── THREAD 2: SENDER PREDICT (17 features → /predict → anomaly) ──
 
 def sender_predict_thread(mqtt_conn):
     log.info("SenderPredict thread started → %s", API_URL)
@@ -203,18 +232,13 @@ def sender_predict_thread(mqtt_conn):
                 raw_pred = response.json().get("prediction", "0")
                 prediction = str(raw_pred)
 
-                # --- DEBUG: log giá trị feature + prediction thực ---
-                feat_debug = dict(zip(TOP15_FEATURES, feats))
-                log.debug("[%s] features: %s", flow_id[:8], feat_debug)
-                log.debug("[%s] raw prediction from model: '%s' (type: %s)",
-                          flow_id[:8], prediction, type(raw_pred).__name__)
-                # ------------------------------------------------------
-
-                log.info("[%s] src=%-15s dst=%-15s port=%-5s → %s (prediction=%r)",
-                         flow_id[:8],
-                         src_ip, dst_ip, dst_port,
-                         "⚠️  ATTACK" if prediction == "1" else "✅ Normal",
-                         prediction)
+                # Log kết quả prediction từ mô hình
+                if prediction == "1":
+                    log_predict.warning("🔴 [%s] ATTACK DETECTED → src=%s dst=%s port=%s",
+                                       flow_id[:12], src_ip, dst_ip, dst_port)
+                else:
+                    log_predict.info("🟢 [%s] Normal Traffic → src=%s dst=%s port=%s",
+                                    flow_id[:12], src_ip, dst_ip, dst_port)
 
                 # Gửi MQTT "anomaly" nếu Student model phát hiện tấn công
                 if prediction == "1" and mqtt_conn:
@@ -226,14 +250,16 @@ def sender_predict_thread(mqtt_conn):
                         "src_ip":   src_ip,
                         "dst_ip":   dst_ip,
                         "dst_port": dst_port,
-                        "features": dict(zip(TOP15_FEATURES, feats)),
+                        "features": dict(zip(TOP17_FEATURES, feats)),
                     })
                     mqtt_conn.publish(
                         topic=TOPIC_ANOM,
                         payload=anomaly_payload,
                         qos=mqtt.QoS.AT_LEAST_ONCE,
                     )
-                    log.warning("🚨 ANOMALY [%s] sent → MQTT topic '%s'", flow_id[:8], TOPIC_ANOM)
+                    # Log thông tin đã gửi anomaly
+                    log_anomaly.critical("🚨 [%s] ANOMALY SENT to MQTT → topic='%s' src=%s dst=%s port=%s",
+                                        flow_id[:12], TOPIC_ANOM, src_ip, dst_ip, dst_port)
             else:
                 log.warning("API HTTP %s: %s", response.status_code, response.text[:100])
 
@@ -286,7 +312,7 @@ def capture_thread():
         except Full:
             log.warning("LOG_QUEUE full — dropping flow.")
 
-        # Đẩy vào PREDICT_QUEUE (flow_id + 15 features)
+        # Đẩy vào PREDICT_QUEUE (flow_id + 17 features)
         try:
             PREDICT_QUEUE.put_nowait((flow_id, extract_features(flow), src_ip, dst_ip, dst_port))
         except Full:
