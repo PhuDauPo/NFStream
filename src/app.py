@@ -4,6 +4,7 @@ from flask import Flask, request, jsonify
 import pandas as pd
 import numpy as np
 import onnxruntime as ort
+import joblib
 import logging
 import sys
 import os
@@ -17,45 +18,51 @@ sys.stdout.reconfigure(line_buffering=True)
 
 # --- LOAD MODEL AND ARTIFACTS ---
 MODEL_PATH = "/app/models/student_lgbm.onnx"
+COLUMNS_PATH = "/app/models/student_lgbm.joblib"
 
 try:
     session = ort.InferenceSession(MODEL_PATH)
     input_name = session.get_inputs()[0].name
+    model_columns = joblib.load(COLUMNS_PATH)
 
     output_name = session.get_outputs()[0].name
     output_info = session.get_outputs()[1].name
 
     print(f"[OK] Successfully loaded ONNX model from '{MODEL_PATH}'")
     print(f"[INFO] Model input features: {session.get_inputs()[0].shape}")
+    print(f"[INFO] Model expects {len(model_columns)} input features.")
 
 except Exception as e:
-    print(f"[ERROR] Could not load ONNX model: {e}", flush=True)
+    print(f"[ERROR] Could not load ONNX model or column file: {e}", flush=True)
     session = None
+    model_columns = None
 
 
 
 original_columns = [
-    'src2dst_syn_ratio',          # syn_packets / src2dst_packets
-    'bidirectional_syn_ratio',    # syn_packets / bidirectional_packets
-    'bidirectional_rst_ratio',    # rst_packets / bidirectional_packets
-    'application_confidence',     # từ NFStream trực tiếp
-    'dst_port_is_well_known',     # dst_port <= 1023 → 1.0
-    'dst_port_bucket',            # 0=well-known, 1=registered, 2=ephemeral
-    'dst2src_rst_packets',        # từ NFStream trực tiếp
-    'protocol',                   # từ NFStream trực tiếp
-    'src2dst_syn_packets',        # từ NFStream trực tiếp
-    'application_category_name',  # encoded theo APP_CAT_MAP
-    'dst2src_min_ps',             # từ NFStream trực tiếp
-    'pkt_per_byte_ratio',         # bidirectional_packets / bidirectional_bytes
-    'dst2src_stddev_ps',          # từ NFStream trực tiếp
-    'bidirectional_min_ps',       # từ NFStream trực tiếp
-    'bidirectional_syn_packets',  # từ NFStream trực tiếp
+    'protocol',                      # 1. Giao thức (TCP/UDP)
+    'dst_port',                      # 2. Port đích
+    'bidirectional_packets',         # 3. Tổng số packets hai chiều
+    'src2dst_packets',               # 4. Số packets từ nguồn đến đích
+    'dst2src_packets',               # 5. Số packets từ đích về nguồn
+    'bidirectional_bytes',           # 6. Tổng số bytes hai chiều
+    'src2dst_bytes',                 # 7. Số bytes từ nguồn đến đích
+    'dst2src_bytes',                 # 8. Số bytes từ đích về nguồn
+    'bidirectional_mean_ps',         # 9. Trung bình packet size hai chiều
+    'bidirectional_stddev_ps',       # 10. Độ lệch chuẩn packet size
+    'bidirectional_duration_ms',     # 11. Thời lượng flow (ms)
+    'bidirectional_mean_piat_ms',    # 12. Trung bình inter-arrival time
+    'bidirectional_max_piat_ms',     # 13. Max inter-arrival time
+    'bidirectional_syn_packets',     # 14. Số SYN packets hai chiều
+    'bidirectional_rst_packets',     # 15. Số RST packets hai chiều
+    'pkt_per_byte_ratio',            # 16. Tỷ lệ packets/bytes
+    'flow_symmetry',                 # 17. Độ đối xứng của flow
 ]
 
 # --- API ENDPOINT ---
 @app.route('/predict', methods=['POST'])
 def predict():
-    if session is None:
+    if session is None or model_columns is None:
         return jsonify({"error": "Model is not available. Please check server logs."}), 500
 
     try:
@@ -67,10 +74,14 @@ def predict():
         feat_named = dict(zip(original_columns, features))
         print(f"[DEBUG] features in: {feat_named}", flush=True)
 
-        # 2. CREATE DATAFRAME & PREPROCESS
-        final_df = pd.DataFrame([features], columns=original_columns)
+        # 2. CREATE DATAFRAME
+        input_df = pd.DataFrame([features], columns=original_columns)
 
-        # 3. MAKE PREDICTION USING ONNX RUNTIME
+        # 3. PREPROCESS INPUT DATA (giống app1.py)
+        processed_df = pd.get_dummies(input_df)
+        final_df = processed_df.reindex(columns=model_columns, fill_value=0)
+
+        # 4. MAKE PREDICTION USING ONNX RUNTIME
         input_feed = {input_name: final_df.to_numpy().astype(np.float32)}
         raw_outputs = session.run(None, input_feed)
         raw_result  = raw_outputs[0][0]
